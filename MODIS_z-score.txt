@@ -1,0 +1,381 @@
+//==========================================================================//
+//
+// Description: Script for creating a z-score time series
+//              based on monthly median MODIS scenes
+//              after cloud, cloud shadow and snow masking
+// Author: Marius Philipp
+// Date: 2021-02-06 
+//  
+//==========================================================================//
+
+// Import country borders
+var countries = ee.FeatureCollection('USDOS/LSIB_SIMPLE/2017');
+
+// Get Feature for Golivia
+var my_aoi = countries.filter(ee.Filter.eq('country_na', 'Germany'));
+Map.addLayer(my_aoi, {}, 'my_aoi');
+
+// Zoom to Germany
+Map.centerObject(my_aoi);
+
+// Define roi for plotting original and z-score values
+var my_roi = ee.Geometry.Rectangle([[10.457, 49.916], [10.534, 49.956]]);
+Map.addLayer(my_roi, {}, 'my_roi');
+
+///// --------------------- \\\\\
+/// Prepare MODIS Collections \\\
+///// --------------------- \\\\\
+
+// Function to extract and rename relevant bands
+function renameBandsMODIS(image) {
+    var bands = ['sur_refl_b03', 'sur_refl_b04', 'sur_refl_b01', 
+                 'sur_refl_b02', 'sur_refl_b05', 'sur_refl_b06', 'sur_refl_b07'];
+    var new_bands = ['B', 'G', 'R', 'NIR1', 'NIR2', 'SWIR1', 'SWIR2'];
+    return image.select(bands).rename(new_bands);
+}
+
+// Function to mask out cloud bits (10), pixels adjacent to clouds (13),
+// cloud shadow bits (2), cirrus bits (8,9) and snow/ice bits (12,15) 
+// based on the quality band
+var maskQuality = function (image) {
+  // Bits 3 and 5 are cloud shadow and cloud, respectively.
+  // Bit 4 is snow
+  var cloudShadowBitMask = (1 << 2);
+  var cirrus1BitMask = (1 << 8);
+  var cirrus2BitMask = (1 << 9);
+  var cloudBitMask = (1 << 10);
+  var snowBitMask = (1 << 12);
+  var cloud2BitMask = (1 << 13);
+  var snow2BitMask = (1 << 15);
+  // Get the pixel QA band.
+  var qa = image.select('StateQA');
+  // Both flags should be set to zero, indicating clear conditions.
+  var mask = qa.bitwiseAnd(cloudShadowBitMask).eq(0)
+                 .and(qa.bitwiseAnd(cirrus1BitMask).eq(0))
+                 .and(qa.bitwiseAnd(cirrus2BitMask).eq(0))
+                 .and(qa.bitwiseAnd(cloudBitMask).eq(0))
+                 .and(qa.bitwiseAnd(snowBitMask).eq(0))
+                 .and(qa.bitwiseAnd(cloud2BitMask).eq(0))
+                 .and(qa.bitwiseAnd(snow2BitMask).eq(0));
+  return image.updateMask(mask);
+};
+ 
+// Import MODIS Terra Surface Reflectance 8-Day L3 Global 500m,
+// filter to dates, mask out bad pixels, select relevant bands and clip to aoi
+var MODIS_col = ee.ImageCollection("MODIS/006/MOD09A1")
+  .map(maskQuality)
+  .map(renameBandsMODIS)
+  .map(function(image){return image.clip(my_aoi)})
+  .filterDate("2000-01-01", "2020-01-01");
+
+
+///// ------------------------------ \\\\\
+/// Add indices to the ImageCollection \\\
+///// ------------------------------ \\\\\
+
+// Create function for NDVI
+function my_ndvi(image) {
+  var ndvi_var = image.expression(
+    "(NIR1 - RED)/(NIR1 + RED)",
+    {
+    NIR1: image.select("NIR1"),
+    RED: image.select("R"),
+    });
+  return image
+    .addBands(ndvi_var
+    .rename('NDVI'))
+    .float();
+}
+
+// Create function for NBR
+function my_nbr(image) {
+  var nbr_var = image.expression(
+    "(NIR1 - SWIR2)/(NIR1 + SWIR2)",
+    {
+    NIR1: image.select("NIR1"),
+    SWIR2: image.select("SWIR2"),
+    });
+  return image
+    .addBands(nbr_var
+    .rename('NBR'))
+    .float();
+}
+
+// Create function for NDMI
+function my_ndmi(image) {
+  var nbr_var = image.expression(
+    "(NIR1 - SWIR1)/(NIR1 + SWIR1)",
+    {
+    NIR1: image.select("NIR1"),
+    SWIR1: image.select("SWIR1"),
+    });
+  return image
+    .addBands(nbr_var
+    .rename('NDMI'))
+    .float();
+}
+
+// Add indices to ImageCollection
+var MODIS_col_indices = MODIS_col
+  .map(my_ndvi)
+  .map(my_nbr)
+  .map(my_ndmi);
+
+
+///// ------------------------------- \\\\\
+/// Remove all pixels with an NDVI <0.2 \\\
+///// ------------------------------- \\\\\
+
+// Define new collection with NDVI >0.2 to furhter
+// reduce any unwanted pixels and noise
+var MODIS_col_indices = MODIS_col_indices
+  .map(function(image){
+    var current_ndvi = image.select("NDVI");
+    var ndvi_mask = current_ndvi.gt(0.2);
+    return image.updateMask(ndvi_mask);
+  });
+
+///// ------------------------------------------------- \\\\\
+/// Reduce image collection to one median image per month \\\
+///// ------------------------------------------------- \\\\\
+
+// Define date of earliest available data
+var start_date = ee.Date(MODIS_col_indices.first().get('system:time_start'));
+
+// Convert starting date into year as a number
+var star_year = ee.Number.parse(start_date.format('YYYY'));
+
+// Define months as a sequence from 1 to 12
+// and years as a sequence from the first year with available data
+// until 2019
+var months = ee.List.sequence(1, 12);
+var years = ee.List.sequence(star_year, 2019);
+
+// Create a median image per month of each year
+// This automatically mosaics and interpolates clouds within one month
+var byMonthYear_indices = ee.ImageCollection.fromImages(
+    years.map(function(y) {
+      return months.map(function (m) {
+        // Filter by year and month
+        var current_month = MODIS_col_indices
+          .filter(ee.Filter.calendarRange(y, y, 'year'))
+          .filter(ee.Filter.calendarRange(m, m, 'month'));
+        // Check number of images within one month
+        var month_size = current_month.size();
+        // Define date for current month and set day to 1,
+        // which will be deleted again (.format('YYYY-MM')) 
+        // but is necessary for the function to work
+        var date = ee.Date.fromYMD(y,m,1)
+          .format('YYYY-MM');
+        // return median of all images per month if number of images is
+        // >= 1 and add information about year and month as well as number
+        // of images within that specific month.
+        // Also copy system:time_start from first available image of the month
+        // -> necessary for harmonic analysis
+        return ee.Algorithms.If(ee.Number(month_size).gte(1),
+                current_month
+                  .median()
+                  .set('Year', y)
+                  .set('Month', m)
+                  .set('Date', date)
+                  .set('images', month_size)
+                  .copyProperties(current_month.first(),['system:time_start']),
+                // Else if no images within one month are available, create an
+                // empty image, clip it to the aoi and add information 
+                // about month and year
+                ee.Image(1).rename("B")
+                  .addBands(ee.Image(1).rename("G"))
+                  .addBands(ee.Image(1).rename("R"))
+                  .addBands(ee.Image(1).rename("NIR1"))
+                  .addBands(ee.Image(1).rename("NIR2"))
+                  .addBands(ee.Image(1).rename("SWIR1"))
+                  .addBands(ee.Image(1).rename("SWIR2"))
+                  .addBands(ee.Image(1).rename("NDVI"))
+                  .addBands(ee.Image(1).rename("NBR"))
+                  .addBands(ee.Image(1).rename("Greeness"))
+                  .clip(my_aoi)
+                  .set('Year', y)
+                  .set('Month', m)
+                  .set('Date', date)
+                  .set('images', month_size));
+      });
+    })
+    // Flatten the collections to one collection because we made one for
+    // each year and one for each month
+    .flatten()
+  );
+
+
+// Turn ImageCollection into List and plot a specific image
+var byMonthYear_indices_list = byMonthYear_indices.toList(byMonthYear_indices.size());
+Map.addLayer(ee.Image(byMonthYear_indices_list.get(200)), {bands: ["R", "G", "B"], min: 0,max: 1500}, "RGB");
+Map.addLayer(ee.Image(byMonthYear_indices_list.get(200)), {bands: ["NDVI"], min: 0,max: 1}, "NDVI");
+
+// Plot the NDVI timeseries over the roi.
+print(ui.Chart.image.series(byMonthYear_indices.select('NDVI'), 
+      my_roi, ee.Reducer.mean(), 500)
+    .setOptions({
+      title: 'MODIS NDVI time-series',
+      lineWidth: 1,
+      pointSize: 3,
+}));
+
+
+///// -------- \\\\\
+/// Detrend Data \\\
+///// -------- \\\\\
+
+// Filter the images to only have months with actual satellite data
+// by looking at the number of images available per month
+var byMonthYear_filtered = byMonthYear_indices
+  .filterMetadata('images','not_equals',0);
+
+// Function to add a time band.
+var addDependents = function(image) {
+  // Compute time in fractional years since the epoch.
+  var years = image.date().difference('1970-01-01', 'year');
+  var timeRadians = ee.Image(years.multiply(2 * Math.PI)).rename('t');
+  var constant = ee.Image(1);
+  return image.addBands(constant).addBands(timeRadians.float());
+};
+
+// Add harmonic variables.
+var byMonthYear_filtered = byMonthYear_filtered
+  .map(addDependents);
+
+// List of the independent variable names
+var independents_trend = ee.List(['constant', 't']);
+
+// Name of the dependent variable for detrending.
+var dependent_trend = 'NDVI';
+
+// Name of the new detrended variable
+var detrended_var = 'Detrended';
+
+// Compute a linear trend.  This will have two bands: 'residuals' and 
+// a 2x1 band called coefficients (columns are for dependent variables).
+var trend = byMonthYear_filtered.select(independents_trend.add(dependent_trend))
+    .reduce(ee.Reducer.linearRegression(independents_trend.length(), 1));
+// Map.addLayer(trend, {}, 'trend array image');
+
+// Flatten the coefficients into a 2-band image
+var coefficients = trend.select('coefficients')
+  .arrayProject([0])
+  .arrayFlatten([independents_trend]);
+
+// Compute a de-trended series.
+var byMonthYear_detrended = byMonthYear_filtered.map(function(image) {
+  var detrended_image = image
+    .select(dependent_trend)
+    .subtract(image.select(independents_trend).multiply(coefficients).reduce('sum'))
+    .rename(detrended_var)
+    .copyProperties(image, ['system:time_start']);
+  return image
+    .addBands(detrended_image);
+});
+
+// Plot the detrended timeseries over the roi.
+print(ui.Chart.image.series(byMonthYear_detrended.select(detrended_var), 
+      my_roi, ee.Reducer.mean(), 500)
+    .setOptions({
+      title: 'Detrended time-series',
+      lineWidth: 1,
+      pointSize: 3,
+}));
+
+
+///// --- \\\\\
+/// z-score \\\
+///// --- \\\\\
+
+// Define dependent variable
+var dependent = detrended_var;
+
+// Define months as a sequence from 1 to 12
+var months = ee.List.sequence(1, 12);
+
+// Calculate mean/median and stdDev for each month
+var median_stdDev = ee.ImageCollection.fromImages(
+      months.map(function(m){
+        // Filter by month
+        var current_month = byMonthYear_detrended
+          .filter(ee.Filter.calendarRange(m, m, 'month'));
+        // Filter by the dependent variable
+        var current_index = current_month
+          .select(dependent);
+        // Reduce the collection with a median reducer.
+        var median = current_index.reduce(ee.Reducer.median());
+        // Reduce the collection with a stdDev reducer.
+        var stdDev = current_index.reduce(ee.Reducer.stdDev());
+        // return image with median and stdDev
+        return median
+          .rename('Median')
+          .addBands(stdDev.rename('stdDev'))
+          .set('Month', m);
+      })
+  );
+
+// Function to turn an ImageCollection to an Image
+var img_fun = function(image) {
+  return ee.Image([]).addBands(image);
+};
+
+// Function for adding the mean and stdDev image of the 
+// respective month to each image in the ImageCollection
+var median_stdDev_fun = function(image){
+  // Get the month from the current image
+  var current_month = image.get('Month');
+  // Filter the median_stdDev collection to the current month
+  var current_median_stdDev = median_stdDev
+    .filterMetadata('Month','equals',current_month);
+  // Get the median
+  var current_median = current_median_stdDev
+    .select("Median");
+  // Get the stdDev
+  var current_stdDev = current_median_stdDev
+    .select("stdDev");
+  // Convert the ImageCollection consisting of one image 
+  // into an actual image
+  var current_median_img = current_median.iterate(img_fun);
+  var current_stdDev_img = current_stdDev.iterate(img_fun);
+  return image
+    .addBands(current_median_img)
+    .addBands(current_stdDev_img);
+};
+
+// Apply median_stdDev_fun function
+var byMonthYear_median_stdDev = byMonthYear_detrended
+  .map(median_stdDev_fun);
+
+// Function to calculate z-score
+function z_score(image) {
+  var z = image.expression(
+    "(x - Median)/stdDev",
+    {
+    x: image.select(dependent),
+    Median: image.select("Median"),
+    stdDev: image.select("stdDev")
+    });
+  return image
+    .addBands(z
+    .rename('z-score'))
+    .float();
+}
+
+// Apply z_score function
+var byMonthYear_zscore = byMonthYear_median_stdDev
+  .map(z_score);
+
+// Plot the z-score timeseries over the roi.
+print(ui.Chart.image.series(byMonthYear_zscore.select('z-score'), 
+      my_roi, ee.Reducer.mean(), 500)
+    .setOptions({
+      title: 'detrended z-score time-series',
+      lineWidth: 1,
+      pointSize: 3,
+}));
+
+
+// print results
+print("byMonthYear_indices", byMonthYear_indices);
+print("byMonthYear_zscore", byMonthYear_zscore);
